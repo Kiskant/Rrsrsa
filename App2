@@ -1,0 +1,379 @@
+import sqlite3
+import json
+import os
+import io
+import pandas as pd
+from flask import Flask, render_template, request, jsonify, g, session, redirect, send_from_directory, send_file
+from werkzeug.utils import secure_filename
+from datetime import datetime
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'super_secret_key_123'
+DATABASE = 'safety.db'
+UPLOAD_FOLDER = 'uploads'
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'pdf', 'doc', 'docx', 'xlsx', 'mp4'}
+
+if not os.path.exists(UPLOAD_FOLDER): os.makedirs(UPLOAD_FOLDER)
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def get_db():
+    db = getattr(g, '_database', None)
+    if db is None:
+        db = g._database = sqlite3.connect(DATABASE)
+        db.row_factory = sqlite3.Row
+    return db
+
+@app.teardown_appcontext
+def close_connection(exception):
+    db = getattr(g, '_database', None)
+    if db is not None: db.close()
+
+def init_db():
+    with app.app_context():
+        db = get_db()
+        try:
+            # Попытка выполнить schema.sql, если он есть
+            with open(os.path.join(app.root_path, 'schema.sql'), mode='r', encoding='utf-8') as f:
+                db.cursor().executescript(f.read())
+            db.commit()
+        except: 
+            pass # Если schema.sql не найден или возникла ошибка
+
+        # --- Обновление и инициализация для категорий памяток и недостающих колонок ---
+        db.execute('''
+            CREATE TABLE IF NOT EXISTS memo_categories (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE
+            );
+        ''')
+        
+        # FIX: Добавляем недостающую колонку target_positions в memos
+        try:
+            db.execute('ALTER TABLE memos ADD COLUMN target_positions TEXT;')
+        except sqlite3.OperationalError:
+            pass # Колонка уже существует
+            
+        # FIX (НОВОЕ): Добавляем недостающую колонку target_positions в library
+        try:
+            db.execute('ALTER TABLE library ADD COLUMN target_positions TEXT;')
+        except sqlite3.OperationalError:
+            pass # Колонка уже существует
+
+        # FIX: Добавляем колонку для категории в таблицу memos
+        try:
+            db.execute('ALTER TABLE memos ADD COLUMN category_name TEXT;')
+        except sqlite3.OperationalError:
+            pass # Колонка уже существует
+        
+        # Вставляем дефолтные категории
+        default_cats = ["Охрана труда", "Первая помощь", "Пожарная безопасность", "Электробезопасность"]
+        for cat in default_cats:
+            try:
+                db.execute("INSERT INTO memo_categories (name) VALUES (?)", (cat,))
+            except sqlite3.IntegrityError:
+                pass 
+        
+        # Обновляем старые записи, где category_name NULL, на "Охрана труда"
+        db.execute('UPDATE memos SET category_name = "Охрана труда" WHERE category_name IS NULL;')
+        
+        db.commit()
+        # -----------------------------------------------------------
+
+def parse_targets(targets_str):
+    if not targets_str: return []
+    return [t.strip() for t in targets_str.split(',') if t.strip()]
+
+def get_user_profile(user_id):
+    db = get_db()
+    user = db.execute('SELECT fio, position, department, role, cert_date FROM users WHERE id = ?', (user_id,)).fetchone()
+    return dict(user) if user else None
+
+# --- ROUTES ---
+@app.route('/')
+def index():
+    if 'user_id' in session:
+        return redirect('/admin') if session.get('role') == 'admin' else redirect('/dashboard')
+    return render_template('index.html')
+
+@app.route('/dashboard')
+def dashboard(): return redirect('/') if 'user_id' not in session else render_template('dashboard.html')
+
+@app.route('/admin')
+def admin(): return redirect('/') if session.get('role') != 'admin' else render_template('admin.html')
+
+@app.route('/admin/questions_management')
+def questions_management(): return redirect('/') if session.get('role') != 'admin' else render_template('questions_management.html')
+
+@app.route('/admin/results')
+def all_results(): return redirect('/') if session.get('role') != 'admin' else render_template('all_results.html')
+
+@app.route('/uploads/<filename>')
+def uploaded_file(filename): return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+# --- API ---
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.json
+    user = get_db().execute('SELECT * FROM users WHERE login = ? AND password = ?', (data.get('login'), data.get('password'))).fetchone()
+    if user:
+        session['user_id'] = user['id']
+        session['fio'] = user['fio'].strip()
+        session['role'] = user['role']
+        session['dept'] = user['department']
+        session['pos'] = user['position']
+        return jsonify({'status': 'success', 'role': user['role']})
+    return jsonify({'status': 'error', 'message': 'Неверный логин'}), 401
+
+@app.route('/api/logout', methods=['POST'])
+def logout(): session.clear(); return jsonify({'status': 'success'})
+
+@app.route('/api/current_user', methods=['GET'])
+def current_user():
+    if 'user_id' not in session: return jsonify({'status': 'error'}), 401
+    return jsonify(get_user_profile(session['user_id']))
+
+@app.route('/api/get_data', methods=['GET'])
+def get_data():
+    db = get_db()
+    if 'user_id' not in session: return jsonify({'status': 'error'}), 401
+    
+    user = get_user_profile(session['user_id'])
+    u_dept, u_pos = user.get('department'), user.get('position')
+    role = session.get('role')
+
+    # Категории тестов
+    all_cats = db.execute('SELECT name, target_depts FROM categories').fetchall()
+    cats = []
+    for c in all_cats:
+        t = parse_targets(c['target_depts'] if c['target_depts'] else '')
+        if role == 'admin' or not c['target_depts'] or (u_dept and u_dept in t):
+            cats.append(c['name'])
+
+    # Памятки (сгруппированные по категории)
+    all_memos_rows = db.execute('SELECT title, url, type, target_positions, category_name FROM memos').fetchall()
+    memos = {}
+    for m in all_memos_rows:
+        t = parse_targets(m['target_positions'] if m['target_positions'] else '')
+        if role == 'admin' or not m['target_positions'] or (u_pos and u_pos in t):
+            cat_name = m['category_name'] if m['category_name'] else 'Охрана труда'
+            if cat_name not in memos:
+                memos[cat_name] = []
+            memos[cat_name].append({'title': m['title'], 'url': m['url'], 'type': m['type']})
+            
+    # Список категорий памяток для админки/отображения
+    memo_cats_rows = db.execute('SELECT name FROM memo_categories ORDER BY name').fetchall()
+    memo_categories = [dict(row)['name'] for row in memo_cats_rows]
+
+    # Библиотека
+    all_lib = db.execute('SELECT title, url, target_positions FROM library').fetchall()
+    library = []
+    for l in all_lib:
+        t = parse_targets(l['target_positions'] if l['target_positions'] else '')
+        if role == 'admin' or not l['target_positions'] or (u_pos and u_pos in t):
+            library.append({'title': l['title'], 'url': l['url']})
+
+    # Вопросы
+    qs = [{'id': r['id'], 'cat': r['category'], 'var': r['variant'], 'q': r['question_text'], 'a': json.loads(r['answers_json'])} for r in db.execute('SELECT * FROM questions').fetchall()]
+    
+    # Результаты
+    res_rows = db.execute('SELECT * FROM results ORDER BY id DESC').fetchall()
+    results = [dict(row) for row in res_rows]
+
+    return jsonify({
+        'categories': cats, 'questions': qs, 'memos': memos, 'library': library, 'results': results,
+        'user_cert_date': user.get('cert_date'),
+        'memo_categories': memo_categories # Добавили список категорий
+    })
+
+# --- API ADMIN ---
+@app.route('/api/users', methods=['GET', 'POST'])
+def manage_users():
+    if session.get('role') != 'admin': return jsonify([]), 403
+    db = get_db()
+    if request.method == 'GET':
+        users = db.execute('SELECT id, fio, login, position, department, snils, birth_date, password, cert_date FROM users WHERE role != "admin"').fetchall()
+        return jsonify([dict(u) for u in users])
+    else:
+        d = request.json
+        try:
+            db.execute('INSERT INTO users (fio, login, password, position, department, snils, birth_date, cert_date) VALUES (?,?,?,?,?,?,?,?)',
+                       (d['fio'], d['login'], d['password'], d['position'], d['department'], d['snils'], d['birth_date'], d['cert_date']))
+            db.commit()
+            return jsonify({'status': 'success'})
+        except: return jsonify({'status': 'error', 'message': 'Ошибка'}), 400
+
+@app.route('/api/users/<int:uid>', methods=['PUT', 'DELETE'])
+def upd_users(uid):
+    if session.get('role') != 'admin': return jsonify({'status': 'error'}), 403
+    db = get_db()
+    if request.method == 'DELETE':
+        db.execute('DELETE FROM users WHERE id=?', (uid,)); db.commit(); return jsonify({'status': 'success'})
+    else:
+        d = request.json
+        db.execute('UPDATE users SET fio=?, login=?, password=?, position=?, department=?, snils=?, birth_date=?, cert_date=? WHERE id=?',
+                   (d['fio'], d['login'], d['password'], d['position'], d['department'], d['snils'], d['birth_date'], d['cert_date'], uid))
+        db.commit()
+    return jsonify({'status': 'success'})
+
+# --- API для управления категориями памяток ---
+@app.route('/api/memo_categories', methods=['GET', 'POST'])
+def manage_memo_categories():
+    if session.get('role') != 'admin': return jsonify([]), 403
+    db = get_db()
+    if request.method == 'GET':
+        cats = db.execute('SELECT id, name FROM memo_categories ORDER BY name').fetchall()
+        return jsonify([dict(c) for c in cats])
+    else: # POST to add new category
+        name = request.json.get('name')
+        if not name: return jsonify({'status': 'error', 'message': 'Нет имени'}), 400
+        try:
+            db.execute('INSERT INTO memo_categories (name) VALUES (?)', (name,))
+            db.commit()
+            return jsonify({'status': 'success'})
+        except sqlite3.IntegrityError:
+            return jsonify({'status': 'error', 'message': 'Такая категория уже есть'}), 400
+
+@app.route('/api/memo_categories/<int:cid>', methods=['DELETE'])
+def delete_memo_category(cid):
+    if session.get('role') != 'admin': return jsonify({'status': 'error'}), 403
+    db = get_db()
+    
+    cat_name_row = db.execute('SELECT name FROM memo_categories WHERE id = ?', (cid,)).fetchone()
+    if not cat_name_row: return jsonify({'status': 'error', 'message': 'Категория не найдена'}), 404
+    cat_name = cat_name_row['name']
+    
+    db.execute('DELETE FROM memo_categories WHERE id=?', (cid,))
+    # Переносим памятки удаленной категории в "Охрана труда"
+    db.execute('UPDATE memos SET category_name = "Охрана труда" WHERE category_name = ?', (cat_name,))
+    
+    db.commit()
+    return jsonify({'status': 'success'})
+# -----------------------------------------------
+
+@app.route('/api/add_question', methods=['POST'])
+def add_question():
+    if session.get('role') != 'admin': return jsonify({'status': 'error'}), 403
+    d = request.json
+    db = get_db()
+    db.execute('INSERT INTO questions (category, variant, question_text, answers_json) VALUES (?,?,?,?)', 
+               (d['cat'], d['variant'], d['q'], json.dumps(d['a'], ensure_ascii=False)))
+    db.commit()
+    return jsonify({'status': 'success'})
+
+@app.route('/api/delete_question/<int:qid>', methods=['DELETE'])
+def del_q(qid):
+    if session.get('role') != 'admin': return jsonify({'status': 'error'}), 403
+    db = get_db()
+    db.execute('DELETE FROM questions WHERE id=?', (qid,))
+    db.commit()
+    return jsonify({'status': 'success'})
+
+@app.route('/api/edit_question', methods=['POST'])
+def edit_q():
+    if session.get('role') != 'admin': return jsonify({'status': 'error'}), 403
+    d = request.json
+    db = get_db()
+    db.execute('UPDATE questions SET category=?, variant=?, question_text=?, answers_json=? WHERE id=?', 
+               (d['cat'], d['variant'], d['q'], json.dumps(d['a'], ensure_ascii=False), d['id']))
+    db.commit()
+    return jsonify({'status': 'success'})
+
+@app.route('/api/categories', methods=['GET'])
+def list_categories():
+    if session.get('role') != 'admin': return jsonify([]), 403
+    return jsonify([dict(c) for c in get_db().execute('SELECT id, name, target_depts FROM categories').fetchall()])
+
+@app.route('/api/categories/<int:cid>', methods=['PUT', 'DELETE'])
+def manage_cat(cid):
+    if session.get('role') != 'admin': return jsonify({'status': 'error'}), 403
+    db = get_db()
+    if request.method == 'DELETE':
+        db.execute('DELETE FROM categories WHERE id=?', (cid,))
+        db.execute('DELETE FROM questions WHERE category=(SELECT name FROM categories WHERE id=?)', (cid,))
+    else:
+        db.execute('UPDATE categories SET name=?, target_depts=? WHERE id=?', (request.json['name'], request.json['depts'], cid))
+    db.commit()
+    return jsonify({'status': 'success'})
+
+@app.route('/api/add_category', methods=['POST'])
+def add_cat():
+    if session.get('role') != 'admin': return jsonify({'status': 'error'}), 403
+    try:
+        db = get_db()
+        db.execute('INSERT INTO categories (name, target_depts) VALUES (?,?)', (request.json['name'], request.json.get('depts', '')))
+        db.commit()
+        return jsonify({'status': 'success'})
+    except: return jsonify({'status': 'error', 'message': 'Дубликат'})
+
+@app.route('/api/add_memo', methods=['POST'])
+def add_memo(): return upload_handler('memos')
+
+@app.route('/api/add_library', methods=['POST'])
+def add_library(): return upload_handler('library')
+
+def upload_handler(table):
+    if session.get('role') != 'admin': return jsonify({'status': 'error'}), 403
+    # Добавили получение category_name для памяток
+    f = request.files.get('file'); t = request.form.get('title'); p = request.form.get('target_positions', ''); c = request.form.get('category_name', 'Охрана труда')
+    if f and allowed_file(f.filename):
+        fn = secure_filename(f.filename)
+        f.save(os.path.join(app.config['UPLOAD_FOLDER'], fn))
+        
+        db = get_db()
+        if table == 'memos':
+            cols = '(title, url, type, target_positions, category_name)'
+            vals = (t, f'/uploads/{fn}', 'image', p, c)
+            placeholders = '?,?,?,?,?'
+        else: # library
+            cols = '(title, url, target_positions)'
+            vals = (t, f'/uploads/{fn}', p)
+            placeholders = '?,?,?'
+            
+        db.execute(f'INSERT INTO {table} {cols} VALUES ({placeholders})', vals)
+        db.commit()
+        return jsonify({'status': 'success'})
+    return jsonify({'status': 'error', 'message': 'Ошибка файла'})
+
+@app.route('/api/save_result', methods=['POST'])
+def save_res():
+    if 'user_id' not in session: return jsonify({'status': 'error'}), 401
+    d = request.json
+    fio = session.get('fio', 'Unknown').strip()
+    current_date = datetime.now().strftime('%Y-%m-%d')
+    db = get_db()
+    db.execute('INSERT INTO results (date, fio, category, variant, score, total, percent) VALUES (?,?,?,?,?,?,?)',
+                     (current_date, fio, d['category'], d.get('variant', 1), d['score'], d['total'], d['percent']))
+    db.commit()
+    return jsonify({'status': 'success'})
+
+@app.route('/api/admin/export_excel')
+def export():
+    if session.get('role') != 'admin': return "Access denied", 403
+    df = pd.read_sql_query("SELECT r.date, r.fio, u.department, u.position, r.category, r.variant, r.score, r.total, r.percent FROM results r LEFT JOIN users u ON r.fio=u.fio ORDER BY r.id DESC", get_db())
+    df['Статус'] = df['percent'].apply(lambda x: 'СДАН' if x >= 80 else 'НЕ СДАН')
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine='openpyxl') as w: df.to_excel(w, index=False)
+    out.seek(0); return send_file(out, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name='report.xlsx')
+
+@app.route('/api/admin/import_questions', methods=['POST'])
+def import_q():
+    if session.get('role') != 'admin': return jsonify({'status': 'error'}), 403
+    try:
+        df = pd.read_excel(request.files['file']); db = get_db(); c = 0
+        for _, r in df.iterrows():
+            db.execute('INSERT INTO questions (category, variant, question_text, answers_json) VALUES (?,?,?,?)',
+                       (r['Category'], int(r['Variant']), r['Question'], json.dumps([str(r['A1']),str(r['A2']),str(r['A3']),str(r['A4'])], ensure_ascii=False)))
+            c += 1
+        db.commit(); return jsonify({'status': 'success', 'count': c})
+    except Exception as e: return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/api/admin/backup')
+def backup(): return send_file(DATABASE, as_attachment=True, download_name='backup.db')
+
+if __name__ == '__main__':
+    try: init_db()
+    except: pass
+    app.run(debug=True, host='0.0.0.0')
